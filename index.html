@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>AR タワーディフェンス</title>
+  <style>
+    body { font-family: sans-serif; background: #1e1e2e; color: #fff; text-align: center; margin: 20px; }
+    canvas { border: 2px solid #fff; display: block; margin: 10px auto; max-width: 100%; height: auto; }
+    .hud { font-size: 18px; }
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 8px;
+      background: #4cc9f0;
+      color: #111;
+      font-size: 18px;
+      font-weight: bold;
+      margin: 10px auto;
+      min-height: 48px;
+      padding: 10px 18px;
+    }
+    button:disabled { opacity: 0.6; }
+    #cameraStatus { min-height: 24px; }
+  </style>
+</head>
+<body>
+  <div class="hud">
+    拠点HP: <span id="hp">10</span> |
+    スコア: <span id="score">0</span>
+  </div>
+  <button id="cameraButton" type="button">カメラを開始</button>
+  <p id="cameraStatus" role="status">カメラボタンを押して許可してください</p>
+  <!-- カメラ映像取得用の非表示video -->
+  <video id="video" width="600" height="360" autoplay playsinline style="display:none;"></video>
+  <canvas id="game" width="600" height="360"></canvas>
+  <p>カメラに「青いマグネット」を映すと、その位置にタワーが配置されます</p>
+
+  <script>
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("game");
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    const cameraButton = document.getElementById("cameraButton");
+    const cameraStatus = document.getElementById("cameraStatus");
+    let cameraStream = null;
+    let cameraReady = false;
+
+    async function startCamera() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        cameraStatus.textContent = "このブラウザではカメラを利用できません。HTTPSまたはlocalhostで開いてください";
+        return;
+      }
+
+      if (!window.isSecureContext && location.protocol !== "file:") {
+        cameraStatus.textContent = "スマホではHTTPSでこのページを開く必要があります";
+        return;
+      }
+
+      cameraButton.disabled = true;
+      cameraStatus.textContent = "カメラを起動中...";
+
+      try {
+        cameraStream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: "environment" },
+            width: { ideal: 600 },
+            height: { ideal: 360 }
+          },
+          audio: false
+        });
+        video.srcObject = cameraStream;
+        await video.play();
+        cameraReady = true;
+        cameraStatus.textContent = "カメラを起動しました";
+        cameraButton.textContent = "カメラ起動中";
+        loop();
+      } catch (err) {
+        cameraButton.disabled = false;
+        cameraStatus.textContent = "カメラを起動できませんでした: " + (err.message || err.name);
+      }
+    }
+
+    cameraButton.addEventListener("click", startCamera);
+
+    const path = [
+      { x: 0, y: 180 },
+      { x: 180, y: 180 },
+      { x: 180, y: 80 },
+      { x: 420, y: 80 },
+      { x: 420, y: 260 },
+      { x: 600, y: 260 }
+    ];
+
+    let hp = 10;
+    let score = 0;
+    let spawnTimer = 0;
+
+    const enemies = [];
+    let towers = []; // 毎フレームカメラから検出して更新
+    const bullets = [];
+
+    // RGBをHSVに変換して「青色」かどうかを判定
+    function isBluePixel(r, g, b) {
+      const max = Math.max(r, g, b), min = Math.min(r, g, b);
+      const d = max - min;
+      const s = max === 0 ? 0 : d / max;
+      const v = max / 255;
+
+      if (s < 0.45 || v < 0.25) return false; // 白・黒・グレーを除外
+
+      let h = 0;
+      if (d !== 0) {
+        if (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) * 60;
+        else if (max === g) h = ((b - r) / d + 2) * 60;
+        else h = ((r - g) / d + 4) * 60;
+      }
+      // 青色の色相範囲（約195度〜255度）
+      return h >= 195 && h <= 255;
+    }
+
+    // 画面内の青い塊（マグネット）を検出してタワーリストを生成
+    function detectBlueTowers() {
+      const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const data = imgData.data;
+      const step = 4; // 処理軽量化のため4pxごとにサンプリング
+      const bluePoints = [];
+
+      for (let y = 0; y < canvas.height; y += step) {
+        for (let x = 0; x < canvas.width; x += step) {
+          const i = (y * canvas.width + x) * 4;
+          if (isBluePixel(data[i], data[i + 1], data[i + 2])) {
+            bluePoints.push({ x, y });
+          }
+        }
+      }
+
+      // 近接する青い点をグループ化（簡易クラスタリング）
+      const clusters = [];
+      for (const pt of bluePoints) {
+        let added = false;
+        for (const c of clusters) {
+          if (Math.hypot(c.cx - pt.x, c.cy - pt.y) < 45) {
+            c.sumX += pt.x;
+            c.sumY += pt.y;
+            c.count++;
+            c.cx = c.sumX / c.count;
+            c.cy = c.sumY / c.count;
+            added = true;
+            break;
+          }
+        }
+        if (!added) {
+          clusters.push({ sumX: pt.x, sumY: pt.y, count: 1, cx: pt.x, cy: pt.y });
+        }
+      }
+
+      // 一定以上の大きさがある塊だけをタワーとして認識（ノイズ除去）
+      const detected = [];
+      for (const c of clusters) {
+        if (c.count >= 8) {
+          // 既存のタワーが近くにあればクールダウンを引き継ぐ
+          const prev = towers.find(t => Math.hypot(t.x - c.cx, t.y - c.cy) < 35);
+          detected.push({
+            x: c.cx,
+            y: c.cy,
+            range: 110,
+            cooldown: prev ? prev.cooldown : 0
+          });
+        }
+      }
+      towers = detected;
+    }
+
+    function spawnEnemy() {
+      enemies.push({ x: path[0].x, y: path[0].y, wpIndex: 1, speed: 1.4, hp: 30 });
+    }
+
+    function update() {
+      spawnTimer++;
+      if (spawnTimer % 75 === 0) spawnEnemy();
+
+      // 敵の移動
+      for (let i = enemies.length - 1; i >= 0; i--) {
+        const en = enemies[i];
+        const target = path[en.wpIndex];
+        const dx = target.x - en.x, dy = target.y - en.y;
+        const d = Math.hypot(dx, dy);
+        if (d < en.speed) {
+          en.x = target.x; en.y = target.y; en.wpIndex++;
+          if (en.wpIndex >= path.length) { hp--; enemies.splice(i, 1); }
+        } else {
+          en.x += (dx / d) * en.speed; en.y += (dy / d) * en.speed;
+        }
+      }
+
+      // タワーの攻撃
+      for (const tw of towers) {
+        if (tw.cooldown > 0) { tw.cooldown--; continue; }
+        const target = enemies.find(en => Math.hypot(en.x - tw.x, en.y - tw.y) <= tw.range);
+        if (target) {
+          bullets.push({ x: tw.x, y: tw.y, target, speed: 5, damage: 15 });
+          tw.cooldown = 35;
+        }
+      }
+
+      // 弾の移動と当たり判定
+      for (let i = bullets.length - 1; i >= 0; i--) {
+        const b = bullets[i];
+        const idx = enemies.indexOf(b.target);
+        if (idx === -1) { bullets.splice(i, 1); continue; }
+        const en = enemies[idx];
+        const dx = en.x - b.x, dy = en.y - b.y;
+        const d = Math.hypot(dx, dy);
+        if (d < b.speed + 8) {
+          en.hp -= b.damage;
+          bullets.splice(i, 1);
+          if (en.hp <= 0) { enemies.splice(idx, 1); score += 10; }
+        } else {
+          b.x += (dx / d) * b.speed; b.y += (dy / d) * b.speed;
+        }
+      }
+
+      document.getElementById("hp").textContent = Math.max(0, hp);
+      document.getElementById("score").textContent = score;
+    }
+
+    function draw() {
+      // 1. まずカメラ映像を描画し、そのピクセルから青いマグネットを検出
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      detectBlueTowers();
+
+      // 2. 経路を半透明で描画
+      ctx.strokeStyle = "rgba(141, 91, 76, 0.75)";
+      ctx.lineWidth = 34;
+      ctx.lineCap = "round";
+      ctx.lineJoin = "round";
+      ctx.beginPath();
+      path.forEach((p, i) => i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y));
+      ctx.stroke();
+
+      // 3. 認識したタワーの射程リングを描画
+      for (const tw of towers) {
+        ctx.strokeStyle = "rgba(76, 201, 240, 0.8)";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(tw.x, tw.y, tw.range, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+
+      // 4. 敵描画
+      for (const en of enemies) {
+        ctx.fillStyle = "#ff4d6d";
+        ctx.beginPath();
+        ctx.arc(en.x, en.y, 11, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      // 5. 弾描画
+      for (const b of bullets) {
+        ctx.fillStyle = "#ffd166";
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      if (hp <= 0) {
+        ctx.fillStyle = "rgba(0,0,0,0.7)";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = "#fff";
+        ctx.font = "32px sans-serif";
+        ctx.fillText("GAME OVER", 205, 190);
+      }
+    }
+
+    function loop() {
+      draw();
+      update();
+      if (hp > 0) requestAnimationFrame(loop);
+    }
+  </script>
+</body>
+</html>
