@@ -100,8 +100,25 @@
     const bullets = [];
 
     // RGBの色偏りから「赤色」かどうかを判定
+    // RGB→HSVに変換して「彩度の高い赤」かどうかを判定(白い背景上の赤い磁石向け)
     function isRedPixel(r, g, b) {
-      return r >= 120 && r - g >= 50 && r - b >= 50;
+      const max = Math.max(r, g, b), min = Math.min(r, g, b);
+      const d = max - min;
+      if (max === 0) return false;
+
+      const s = d / max;   // 彩度(白・グレーは小さい)
+     const v = max / 255; // 明度
+
+      // 白い背景・影・グレーを除外
+      if (s < 0.5 || v < 0.3) return false;
+
+      // 赤が最大でなければ除外
+      if (max !== r) return false;
+
+      // 色相(赤は0度付近をまたぐ: 0〜20度 または 340〜360度)
+      let h = ((g - b) / d) * 60;
+      if (h < 0) h += 360;
+      return h <= 20 || h >= 340;
     }
 
     // 画面内の赤い塊（マグネット）を検出してタワーリストを生成
